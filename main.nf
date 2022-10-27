@@ -1,9 +1,9 @@
 #!/usr/bin/env nextflow
 /*
 ========================================================================================
-                         SteadyFlow - Steady Sate Transcription PIPELINE
+                         SteadyFlow - Variant Calling PIPELINE
 ========================================================================================
-Steady Sate Analysis Pipeline. Started 2018-06-21.
+Steady Sate Analysis Pipeline. Started 2022-10-17.
  #### Homepage / Documentation
 
  # Author: Qing Yang <qing.yang@colorado.edu>
@@ -21,25 +21,12 @@ Pipeline steps:
         2a. BBDuk -- trim fastq files for quality and adapters
         2b. FastQC (post-trim) -- perform post-trim FastQC on fastq files (ensure trimming performs as expected)
 
-    3. Mapping w/ STAR -- map to genome reference file
+    3. Mapping w/ BWA -- map to genome reference file and merge bam files
 
-    4. SAMtools -- convert SAM file to BAM, index BAM, flagstat BAM
+    4. Mark duplicates and base quality calibration
 
-    5. Quality control
-        5a. RSeQC -- calculate genomic coverage relative to a reference file, infer experiement (single- v. paired-end), read duplication
-        5b. Pileup.sh : BBMap Suite -- genomic coverage by chromosome, GC content, pos/neg reads, intron/exon ratio
+    5. Haplotype calling
 
-    6. Coverage files
-        6d. BEDTools : non-normalized & nornmalized bedgraphs
-        6b. BEDTools and kentUtils : 5' bigwigs for dREG & normalized bigwigs for genome browser
-
-    7. Normalizing bigwigs for Genome Browser use
-
-    8. IGV Tools : bedGraph --> tdf
-
-    9. featureCounts : Read counts for a provided RefSeq annotation file
-
-    10. MultiQC : generate QC report for pipeline
 
 */
 
@@ -71,19 +58,13 @@ def helpMessage() {
         --outdir                       Specifies where to save the output from the nextflow run.
         --savefq                       Compresses and saves raw fastq reads.
         --saveTrim                     Compresses and saves trimmed fastq reads.
-        --skipBAM                      Skip saving BAM files. Only CRAM files will be saved with this option.
-        --saveAll                      Compresses and saves all fastq reads.
-        --savebw                       Saves pos/neg bigwig files for UCSC genome browser.
-        --savebg                       Saves concatenated pos/neg bedGraph file.
 
     QC Options:
         --skipMultiQC                  Skip running MultiQC.
-        --skipRSeQC                    Skip running RSeQC.
 
     Analysis Options:
-        --count                        Run featureCounts over RefSeq annotated genes.
-        --salmon                       Run Salmon to count fastq reads directly against transcriptome.
-
+        --MuTect2
+        --HaplotypeCaller
 
     """.stripIndent()
 }
@@ -105,8 +86,6 @@ params.multiqc_config = "$baseDir/conf/multiqc_config.yaml"
 params.email = false
 params.plaintext_email = false
 params.bbmap_adapters = "$baseDir/bin/adapters.fa"
-params.bedGraphToBigWig = "$baseDir/bin/bedGraphToBigWig"
-params.rcc = "$baseDir/bin/rcc.py"
 params.workdir = "./nextflowTemp"
 
 multiqc_config = file(params.multiqc_config)
@@ -124,20 +103,15 @@ if ( params.chrom_sizes ){
     if( !chrom_sizes.exists() ) exit 1, "Genome chrom sizes file not found: ${params.chrom_sizes}"
  }
 
-if ( params.star_indices ){
-    star_indices = file("${params.star_indices}")
-}
+ if ( params.picard_path ){
+     picard_path = file("${params.picard_path}")
+ }
+ if ( params.known_sites_dir ){
+     known_sites_dir = file("${params.known_sites_dir}")
+ }
 
-if ( params.salmon_indices ){
-    salmon_indices = file("${params.salmon_indices}")
-}
-
-if ( params.genome_refseq ){
-    genome_refseq = file("${params.genome_refseq}")
-}
-
-if ( params.annotation_gtf ){
-    annotation_gtf = file("${params.annotation_gtf}")
+if ( params.bwa_indices ){
+    bwa_indices = file("${params.bwa_indices}")
 }
 
 if ( params.bbmap_adapters){
@@ -150,7 +124,6 @@ custom_runName = params.name
 if( !(workflow.runName ==~ /[a-z]+_[a-z]+/) ){
   custom_runName = workflow.runName
 }
-
 
 
 /*
@@ -171,7 +144,6 @@ if (params.fastqs) {
             .into { fastq_reads_qc; fastq_reads_trim; fastq_reads_gzip }
     }
 }
-
 else {
     Channel
         .empty()
@@ -184,7 +156,6 @@ if (params.sras) {
                         .fromPath(params.sras)
                         .map { file -> tuple(file.baseName, file) }
 }
-
 else {
     read_files_sra = Channel.empty()
 }
@@ -195,7 +166,7 @@ log.info """=======================================================
 RNAseq Flow v${params.version}"
 ======================================================="""
 def summary = [:]
-summary['Pipeline Name']    = 'NascentFlow'
+summary['Pipeline Name']    = 'variantCallFlow'
 summary['Help Message']     = params.help
 summary['Pipeline Version'] = params.version
 summary['Run Name']         = custom_runName ?: workflow.runName
@@ -204,17 +175,10 @@ if(params.fastqs) summary['Fastqs']   = params.fastqs
 if(params.sras) summary['SRAs']       = params.sras
 summary['Genome Ref']       = params.genome
 summary['Data Type']        = params.singleEnd ? 'Single-End' : 'Paired-End'
-summary['Save All fastq']   = params.saveAllfq ? 'YES' : 'NO'
-summary['Save BAM']         = params.skipBAM ? 'NO' : 'YES'
-summary['Save BigWig']      = params.savebw ? 'YES' : 'NO'
-summary['Save bedGraph']    = params.savebg ? 'YES' : 'NO'
 summary['Save fastq']       = params.savefq ? 'YES' : 'NO'
 summary['Save Trimmed']     = params.saveTrim ? 'YES' : 'NO'
 summary['Reverse Comp']     = params.flip ? 'YES' : 'NO'
 summary['Reverse Comp R2']  = params.flipR2 ? 'YES' : 'NO'
-summary['Run RSeQC']        = params.skipRSeQC ? 'NO' : 'YES'
-summary['Run Count']        = params.count ? 'NO' : 'YES'
-summary['Run Salmon']       = params.salmon ? 'NO' : 'YES'
 summary['Run MultiQC']      = params.skipMultiQC ? 'NO' : 'YES'
 summary['Max Memory']       = params.max_memory
 summary['Max CPUs']         = params.max_cpus
@@ -264,11 +228,8 @@ process get_software_versions {
     echo $workflow.nextflow.version > v_nextflow.txt
     fastqc --version > v_fastqc.txt
     bbversion.sh --version > v_bbduk.txt
-    STAR --version > v_STAR.txt
     samtools --version > v_samtools.txt
     fastq-dump --version > v_fastq-dump.txt
-    bedtools --version > v_bedtools.txt
-    igvtools version > v_igv-tools.txt
     multiqc --version > v_multiqc.txt
 
     for X in `ls *.txt`; do
@@ -279,7 +240,7 @@ process get_software_versions {
 }
 
 /*
- * Step 1a -- get fastq files from downloaded sras
+ * Step 1 -- get fastq files from downloaded sras
  */
 
 process sra_dump {
@@ -313,7 +274,7 @@ process sra_dump {
 }
 
 /*
- * STEP 1b - FastQC
+ * STEP 2 - FastQC
  */
 
 process fastQC {
@@ -338,7 +299,7 @@ process fastQC {
 
 
 /*
- * STEP 2a - Trimming
+ * STEP 3 - Trimming
  */
 
 process bbduk {
@@ -357,7 +318,7 @@ process bbduk {
     set val(name), file(reads) from fastq_reads_trim.mix(fastq_reads_trim_sra)
 
     output:
-    set val(name), file ("*.trim.fastq.gz") into trimmed_reads_fastqc, trimmed_reads_star, trimmed_reads_salmon
+    set val(name), file ("*.trim.fastq.gz") into trimmed_reads_fastqc, trimmed_reads_bwa
     file "*.txt" into trim_stats
 
     script:
@@ -384,7 +345,6 @@ process bbduk {
                 nullifybrokenquality=t \
                 maq=10 minlen=25 \
                 tpe tbo \
-                literal=AAAAAAAAAAAAAAAAAAAAAAA \
                 stats=${name}.trimstats.txt \
                 refstats=${name}.refstats.txt
         """
@@ -411,7 +371,6 @@ process bbduk {
                 nullifybrokenquality=t \
                 maq=10 minlen=25 \
                 tpe tbo \
-                literal=AAAAAAAAAAAAAAAAAAAAAAA \
                 stats=${name}.trimstats.txt \
                 refstats=${name}.refstats.txt
         """
@@ -436,7 +395,6 @@ process bbduk {
                   nullifybrokenquality=t \
                   maq=10 minlen=25 \
                   tpe tbo \
-                  literal=AAAAAAAAAAAAAAAAAAAAAAA \
                   stats=${name}.trimstats.txt \
                   refstats=${name}.refstats.txt
         """
@@ -472,7 +430,7 @@ process bbduk {
 
 
 /*
- * STEP 2b - Trimmed FastQC
+ * STEP 4 - Trimmed FastQC
  */
 
 process fastqc_trimmed {
@@ -498,437 +456,140 @@ process fastqc_trimmed {
 
 
 /*
- * STEP 3 - Map reads to reference genome
+ * STEP 5 - Map reads to reference genome
  */
 
-process star {
+process bwa {
     errorStrategy { task.exitStatus=0 ? 'ignore' : 'terminate' }
     tag "$name"
     cpus 16
     memory '50 GB'
     time '5h'
-    publishDir "${params.outdir}/qc/star_mapstats", mode: 'copy', pattern: "*.txt"
 
     input:
-    file(indices) from star_indices
-    val(indices_path) from star_indices
-    set val(name), file(trimmed_reads) from trimmed_reads_star
+    val(indices_path) from bwa_indices
+    val(picard_path) from picard_path
+    set val(name), file(trimmed_reads) from trimmed_reads_bwa
 
     output:
-    set val(name), file("*.sam") into star_sam
-    file("*.final.out") into star_mapstats
+    set val(name), file("*.bam") into bwa_bam
 
     script:
     if (!params.singleEnd) {
         """
         echo ${name}
-        STAR --genomeDir ${indices_path} \
-              --runThreadN 16 \
-              --readFilesCommand gunzip -c \
-              --readFilesIn ${name}_R1.trim.fastq.gz ${name}_R2.trim.fastq.gz \
-              --outFileNamePrefix ${name} \
+        bwa mem -t 16 \
+                -T 0 \
+                ${indices_path} \
+                ${name}_R1.trim.fastq.gz ${name}_R2.trim.fastq.gz | \
+                java -Xmx30g -jar ${picard_path}/picard.jar \
+                SortSam \
+                I=/dev/stdin \
+                O=${name}.bam \
+                SORT_ORDER=coordinate
 
         """
     } else {
         """
         echo ${name}
-
-        STAR --genomeDir ${indices_path} \
-              --runThreadN 16 \
-              --readFilesCommand gunzip -c \
-              --readFilesIn ${trimmed_reads} \
-              --outFileNamePrefix ${name} \
+        bwa mem -t 16 \
+                -T 0 \
+                ${indices_path} \
+                ${trimmed_reads} | \
+                java -Xmx30g -jar ${picard_path}/picard.jar \
+                SortSam \
+                I=/dev/stdin \
+                O=${name}.bam \
+                SORT_ORDER=coordinate
 
         """
     }
 }
 
 /*
- * STEP 4 - Convert to BAM format and sort
+ * STEP 6 - Mark duplicates, base quality calibration
  */
 
-process samtools {
+process preprocess {
     tag "$name"
     memory '100 GB'
     cpus 16
     publishDir "${params.outdir}" , mode: 'copy',
-    saveAs: {filename ->
-             if ((filename.indexOf("sorted.bam") > 0) & !params.skipBAM)                                                                                                                             "mapped/bams/$filename"
-        else if ((filename.indexOf("sorted.bam.bai") > 0) & !params.skipBAM)                                                                                                                         "mapped/bams/$filename"
-        else if (filename.indexOf("flagstat") > 0)                    "qc/mapstats/$filename"
-        else if (filename.indexOf("millionsmapped") > 0)              "qc/mapstats/$filename"
-        else if (filename.indexOf("sorted.cram") > 0)                 "mapped/crams/$filename"
-        else if (filename.indexOf("sorted.cram.crai") > 0)            "mapped/crams/$filename"
-    }
+                saveAs: {filename ->
+                  if (filename.indexOf("preprocessed.bam") > 0) "mapped/bams/$filename"
+                }
 
     input:
-    set val(name), file(mapped_sam) from star_sam
+    val(known_sites_dir) from known_sites_dir
+    val(genome) from genome
+    val(picard_path) from picard_path
+    set val(name), file(mapped_bam) from bwa_bam
 
     output:
-    set val(name), file("${name}.sorted.bam") into sorted_bam_ch
-    set val(name), file("${name}.sorted.bam.bai") into sorted_bam_indices_ch
-    set val(name), file("${name}.flagstat") into bam_flagstat
-    set val(name), file("${name}.millionsmapped") into bam_milmapped_bedgraph
-    set val(name), file("${name}.sorted.cram") into cram_out
-    set val(name), file("${name}.sorted.cram.crai") into cram_index_out
+    set val(name), file("${name}.preprocessed.bam") into preproc_bam
+    file("metrics.txt") into bam_metrics
 
     script:
-    if (!params.singleEnd) {
     """
+    gatk MarkDuplicates \
+          --java-options -Xmx30g \
+          I=${name}.bam \
+          O=${name}.marke_dup.bam \
+          M=metrics.txt
 
-    samtools view -@ 16 -bS -o ${name}.bam ${mapped_sam}
-    samtools sort -@ 16 ${name}.bam > ${name}.sorted.bam
-    samtools flagstat ${name}.sorted.bam > ${name}.flagstat
-    samtools view -@ 16 -F 0x40 ${name}.sorted.bam | cut -f1 | sort | uniq | wc -l > ${name}.millionsmapped
-    samtools index ${name}.sorted.bam ${name}.sorted.bam.bai
-    samtools view -@ 16 -C -T ${genome} -o ${name}.cram ${name}.sorted.bam
-    samtools sort -@ 16 -O cram ${name}.cram > ${name}.sorted.cram
-    samtools index -c ${name}.sorted.cram ${name}.sorted.cram.crai
-    """
-    } else {
-    """
+    java -Xmx30g -jar ${picard_path}/picard.jar AddOrReplaceReadGroups \
+           I=${name}.marke_dup.bam \
+           O=${name}.rg.bam \
+           RGID=${name} \
+           RGLB=lib1 \
+           RGPL=ILLUMINA \
+           RGPU=unit1 \
+           RGSM=${name}
 
-    samtools view -@ 16 -bS -o ${name}.bam ${mapped_sam}
-    samtools sort -@ 16 ${name}.bam > ${name}.sorted.bam
-    samtools flagstat ${name}.sorted.bam > ${name}.flagstat
-    samtools view -@ 16 -F 0x904 -c ${name}.sorted.bam > ${name}.millionsmapped
-    samtools index ${name}.sorted.bam ${name}.sorted.bam.bai
-    samtools view -@ 16 -C -T ${genome} -o ${name}.cram ${name}.sorted.bam
-    samtools sort -@ 16 -O cram ${name}.cram > ${name}.sorted.cram
-    samtools index -c ${name}.sorted.cram ${name}.sorted.cram.crai
+    gatk BaseRecalibrator \
+          --java-options -Xmx30g \
+          --input ${name}.rg.bam \
+          --output ${name}.recal.table \
+          --known-sites ${known_sites_dir}/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz \
+          --known-sites ${known_sites_dir}/Homo_sapiens_assembly38.dbsnp138.vcf \
+          --known-sites ${known_sites_dir}/Homo_sapiens_assembly38.known_indels.vcf.gz \
+          --reference ${genome}
+
+    gatk ApplyBQSR \
+      -R ${genome} \
+      -I ${name}.rg.bam \
+      --bqsr-recal-file ${name}.recal.table \
+      -O ${name}.preprocessed.bam
+
     """
-    }
 }
 
-sorted_bam_ch
-   .into {sorted_bams_for_bedtools_bedgraph; sorted_bams_for_rseqc; sorted_bams_for_dreg_prep; sorted_bams_for_pileup; sorted_bams_for_featureCounts}
-
-sorted_bam_indices_ch
-    .into {sorted_bam_indices_for_bedtools_bedgraph; sorted_bam_indices_for_bedtools_normalized_bedgraph; sorted_bam_indicies_for_pileup; sorted_bam_indices_for_rseqc; sorted_bam_indices_for_featureCounts}
-
-
 /*
- *STEP 5a - Analyze read distributions using RSeQC
+ * WIP STEP 7 - Individual variant calls, run in GVCF format
  */
-
-process rseqc_qc {
-    errorStrategy { task.exitStatus=0 ? 'ignore' : 'terminate' }
-    tag "$name"
-    time '8h'
-    memory '40 GB'
-    publishDir "${params.outdir}/qc/rseqc" , mode: 'copy',
-        saveAs: {filename ->
-             if (filename.indexOf("infer_experiment.txt") > 0)                       "infer_experiment/$filename"
-        else if (filename.indexOf("read_distribution.txt") > 0)                      "read_distribution/$filename"
-        else if (filename.indexOf("read_duplication.DupRate_plot.pdf") > 0)          "read_duplication/$filename"
-        else if (filename.indexOf("read_duplication.DupRate_plot.r") > 0)            "read_duplication/rscripts/$filename"
-        else if (filename.indexOf("read_duplication.pos.DupRate.xls") > 0)           "read_duplication/dup_pos/$filename"
-        else if (filename.indexOf("read_duplication.seq.DupRate.xls") > 0)           "read_duplication/dup_seq/$filename"
-        else if (filename.indexOf("junction_annotation.junction.xls") > 0)           "junction_annotation/anno/$filename"
-        else if (filename.indexOf("junction_annotation.junction_plot.r") > 0)        "junction_annotation/rscripts/$filename"
-        else if (filename.indexOf("junction_annotation.splice_events.pdf") > 0)      "junction_annotation/$filename"
-        else if (filename.indexOf("junction_annotation.splice_junction.pdf") > 0)    "junction_annotation/$filename"
-        else if (filename.indexOf("bam_stat.txt") > 0)                               "bam_stat/$filename"
-        else if (filename.indexOf("junction_saturation.junctionSaturation_plot.r") > 0)                                                                                                                            "junction_saturation/rscripts/$filename"
-        else if (filename.indexOf("junction_saturation.junctionSaturation_plot.pdf") > 0)                                                                                                                          "junction_saturation/$filename"
-        else filename
-        }
-
-    when:
-    !params.skipRSeQC
-
-    input:
-    set val(name), file(bam_file) from sorted_bams_for_rseqc
-    file(bam_indices) from sorted_bam_indices_for_rseqc
-
-    output:
-    file "*.{txt,pdf,r,xls}" into rseqc_results
-
-    script:
-    """
-    export PATH=~/.local/bin:$PATH
-
-    read_distribution.py -i ${bam_file} \
-                         -r ${genome_refseq} \
-                         > ${name}.read_distribution.txt
-
-    read_duplication.py -i ${bam_file} \
-                        -o ${name}.read_duplication
-
-    infer_experiment.py -i ${bam_file} \
-                        -r ${genome_refseq} \
-                        > ${name}.infer_experiment.txt
-
-    bam_stat.py -i ${bam_file} \
-                        > ${name}.bam_stat.txt
-
-    junction_annotation.py -i ${bam_file} \
-                           -o ${name}.junction_annotation \
-                           -r ${genome_refseq}
-
-    junction_saturation.py -i ${bam_file} \
-                           -o ${name}.junction_saturation \
-                           -r ${genome_refseq}
-    """
- }
-
-
-/*
- *STEP 5b - Analyze coverage using pileup.sh
- */
-
-process pileup {
-    tag "$name"
-    memory '50 GB'
-    publishDir "${params.outdir}/qc/pileup", mode: 'copy', pattern: "*.txt"
-
-    input:
-    set val(name), file(bam_file) from sorted_bams_for_pileup
-    file(bam_indices) from sorted_bam_indicies_for_pileup
-
-    output:
-    file("*.txt") into pileup_results
-
-    script:
-    """
-
-    pileup.sh -Xmx20g \
-              in=${bam_file} \
-              out=${name}.coverage.stats.txt \
-              hist=${name}.coverage.hist.txt
-    """
- }
-
- /*
-  *STEP 5c - Count reads mapped to genome using refseq annotation and featureCounts
-  */
-
- process featureCounts {
-      errorStrategy { task.exitStatus=0 ? 'ignore' : 'terminate' }
-      tag "$name"
-      time '8h'
-      memory '40 GB'
-      publishDir "${params.outdir}/counts" , mode: 'copy', pattern: "*.counts*"
-
-      when:
-      params.count
-
-      input:
-      set val(name), file(bam_file) from sorted_bams_for_featureCounts
-      file(bam_indices) from sorted_bam_indices_for_featureCounts
-
-      output:
-      file "*.counts*" into counts
-
-      script:
-      if (!params.singleEnd) {
-      """
-      featureCounts ${bam_file} \
-                             -o ${name}.counts \
-                             -a ${annotation_gtf} \
-                             -t exon \
-                             -g gene_id \
-                             -M -O \
-                             -p \
-                             -s 0
-      """
-      } else {
-      """
-      featureCounts ${bam_file} \
-                             -o ${name}.counts \
-                             -a ${annotation_gtf} \
-                             -t exon \
-                             -g gene_id \
-                             -M -O \
-                             -s 0
-      """
-      }
-   }
-
-/*
- *STEP 5d - Count trimmed raw reads directly against transcriptome
- */
-
-process salmon {
-     errorStrategy { task.exitStatus=0 ? 'ignore' : 'terminate' }
+ process haplotypeCaller {
      tag "$name"
-     time '4h'
-     memory '10 GB'
-     publishDir "${params.outdir}/salmon" , mode: 'copy', pattern: "${name}_quant*"
-
-     when:
-     params.salmon
+     memory '100 GB'
+     cpus 16
+     publishDir "${params.outdir}/processed/vcf/", mode: 'copy',
+         saveAs: {filename -> if(filename.indexOf("vcf") > 0) "$filename"}
 
      input:
-     set val(name), file(trimmed_reads) from trimmed_reads_salmon
-     file(indices) from salmon_indices
-     val(indices_path) from salmon_indices
+     val(genome) from genome
+     set val(name), file(preproc_bam) from preproc_bam
 
      output:
-     file "${name}_quant*" into salmon
+     set val(name), file("${name}.g.vcf.gz") into gvcf
 
      script:
-     if (!params.singleEnd) {
      """
-     salmon quant -i ${indices_path} -l A \
-         -1 ${name}_R1.trim.fastq.gz \
-         -2 ${name}_R2.trim.fastq.gz \
-         -p 16 --validateMappings -o ${name}_quant
-
+     gatk --java-options "-Xmx4g" HaplotypeCaller \
+      -R ${genome} \
+      -I ${preproc_bam} \
+      -O ${name}.g.vcf.gz \
+      -ERC GVCF
      """
-     } else {
-     """
-     salmon quant -i ${indices_path} -l A \
-         -r ${trimmed_reads} \
-         -p 16 --validateMappings -o ${name}_quant
 
-     """
-     }
-  }
-
-
-
-
-
-
-/*
- *STEP 6a - Create non-normalzied bedGraphs
- */
-
-process bedgraphs {
-    errorStrategy { task.exitStatus=0 ? 'ignore' : 'terminate' }
-
-    tag "$name"
-    memory '80 GB'
-    time '4h'
-    if (params.savebg) {
-            publishDir "${params.outdir}/mapped/bedgraphs", mode: 'copy', pattern: "${name}.bedGraph"
-    }
-
-    input:
-    set val(name), file(bam_file) from sorted_bams_for_bedtools_bedgraph
-    set val(name), file(bam_indices) from sorted_bam_indices_for_bedtools_bedgraph
-    set val(name), file(millions_mapped) from bam_milmapped_bedgraph
-
-    output:
-    set val(name), file("*pos.bedGraph") into pos_non_normalized_bedgraphs
-    set val(name), file("*neg.bedGraph") into neg_non_normalized_bedgraphs
-    set val(name), file("${name}.bedGraph") into non_normalized_bedgraphs
-    set val(name), file("${name}.rcc.bedGraph") into bedgraph_tdf
-    set val(name), file("${name}.pos.rcc.bedGraph") into bedgraph_bigwig_pos
-    set val(name), file("${name}.neg.rcc.bedGraph") into bedgraph_bigwig_neg
-
-    script:
-    """
-
-    bedtools genomecov \
-                     -bg \
-                     -strand + \
-                     -g hg38 \
-                     -ibam ${bam_file} \
-                     -split \
-                     > ${name}.pos.bedGraph
-
-    bedtools genomecov \
-                     -bg \
-                     -strand - \
-                     -g hg38 \
-                     -ibam ${bam_file} \
-                     -split \
-                     > ${name}.tmp.neg.bedGraph
-
-    awk 'BEGIN{FS=OFS="\t"} {\$4=-\$4}1' ${name}.tmp.neg.bedGraph \
-        > ${name}.neg.bedGraph
-        rm ${name}.tmp.neg.bedGraph
-
-    cat ${name}.pos.bedGraph \
-        ${name}.neg.bedGraph \
-        > ${name}.unsorted.bedGraph
-
-    bedtools sort \
-             -i ${name}.unsorted.bedGraph \
-             > ${name}.bedGraph
-
-    rm ${name}.unsorted.bedGraph
-
-    python ${params.rcc} \
-        ${name}.bedGraph \
-        ${millions_mapped} \
-        ${name}.rcc.bedGraph \
-
-    python ${params.rcc} \
-        ${name}.pos.bedGraph \
-        ${millions_mapped} \
-        ${name}.unsorted.pos.rcc.bedGraph
-
-    bedtools sort -i ${name}.unsorted.pos.rcc.bedGraph > ${name}.pos.rcc.bedGraph
-    rm ${name}.unsorted.pos.rcc.bedGraph
-
-    python ${params.rcc} \
-        ${name}.neg.bedGraph \
-        ${millions_mapped} \
-        ${name}.unsorted.neg.rcc.bedGraph
-
-    bedtools sort -i ${name}.unsorted.neg.rcc.bedGraph > ${name}.neg.rcc.bedGraph
-    rm ${name}.unsorted.neg.rcc.bedGraph
-
-    """
- }
-
-/*
- *STEP 7 - Normalize bigWigs by millions of reads mapped for visualization
- */
-
-process normalized_bigwigs {
-    errorStrategy { task.exitStatus=0 ? 'ignore' : 'terminate' }
-
-    tag "$name"
-    memory '30 GB'
-    publishDir "${params.outdir}/mapped/rcc_bigwig", mode: 'copy'
-
-    when:
-    params.savebw
-
-    input:
-    set val(name), file(neg_bedgraph) from bedgraph_bigwig_neg
-    set val(name), file(pos_bedgraph) from bedgraph_bigwig_pos
-    file(chrom_sizes) from chrom_sizes
-
-    output:
-    set val(name), file("*.rcc.bw") into normalized_bigwig
-
-    script:
-    """
-    ${params.bedGraphToBigWig} ${pos_bedgraph} ${chrom_sizes} ${name}.pos.rcc.bw
-    ${params.bedGraphToBigWig} ${neg_bedgraph} ${chrom_sizes} ${name}.neg.rcc.bw
-
-    """
-}
-
-/*
- *STEP 8 - IGV Tools : generate tdfs for optimal visualization in Integrative Genomics Viewer (IGV)
- */
-
-process igvtools {
-    tag "$name"
-    memory '200 GB'
-    time '1h'
-    // This often blows up due to a ceiling in memory usage, so we can ignore
-    // and re-run later as it's non-essential.
-    errorStrategy 'ignore'
-    publishDir "${params.outdir}/mapped/tdfs", mode: 'copy', pattern: "*.tdf"
-
-    input:
-    set val(name), file(normalized_bg) from bedgraph_tdf
-    file(chrom_sizes) from chrom_sizes
-
-    output:
-    set val(name), file("*.tdf") into tiled_data_ch
-
-    script:
-    """
-    igvtools toTDF ${normalized_bg} ${name}.rcc.tdf ${chrom_sizes}
-    """
  }
 
 /*
@@ -947,10 +608,7 @@ process multiQC {
     file (fastqc:'qc/fastqc/*') from fastqc_results.collect()
     file ('qc/fastqc/*') from trimmed_fastqc_results.collect()
     file ('qc/trimstats/*') from trim_stats.collect()
-    file ('qc/mapstats/*') from bam_flagstat.collect()
-    file ('qc/rseqc/*') from rseqc_results.collect()
     file ('software_versions/*') from software_versions_yaml
-    file ('qc/star_mapstats/*') from star_mapstats.collect()
 
     output:
     file "*multiqc_report.html" into multiqc_report

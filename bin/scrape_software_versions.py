@@ -9,10 +9,6 @@ regexes = {
     'FastQC': ['v_fastqc.txt', r"FastQC v(\S+)"],
     'MultiQC': ['v_multiqc.txt', r"multiqc, version (\S+)"],
     'Samtools': ['v_samtools.txt', r"samtools (\S+)"],
-    'Bedtools': ['v_bedtools.txt', r"bedtools v(\S+)"],
-    'IGV Tools': ['v_igv-tools.txt', r"IGV Version (\S+)"],
-    'BBduk': ['v_bbduk.txt', r"BBDuk Trimming version(\S+)"],
-    'STAR': ['v_STAR.txt', r"STAR Aligner version (\S+)"],
 }
     #'RseQC': ['v_rseqc.txt', r"RSeQC version(\S+)"],
 
